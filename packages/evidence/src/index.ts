@@ -252,15 +252,37 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return stdout;
 }
 
+/** Files hashed concurrently by `workspaceTreeDigest` (bounds open files and memory). */
+const TREE_DIGEST_CONCURRENCY = 16;
+
 /**
  * Content digest of the whole working tree by directory walk (tracked,
- * untracked and ignored files alike, including node_modules). Symlinks are
- * hashed by their target and never followed; `.git` and Brokkr state are
- * excluded.
+ * untracked and ignored files alike, including node_modules: installed
+ * dependencies decide what the checks execute, so they are part of the state
+ * being identified). Symlinks are hashed by their target and never followed;
+ * `.git` and Brokkr state are excluded. Records are hashed in walk order through
+ * a sliding window: at most TREE_DIGEST_CONCURRENCY records (and file reads) are
+ * pending, and the walk waits for the oldest before going further, so memory
+ * does not grow with the file count.
  */
 export async function workspaceTreeDigest(workspace: string): Promise<string> {
   const root = await realpath(workspace);
   const hash = createHash("sha256");
+  const pending: Array<string | Promise<string>> = [];
+  const drainOldest = async (): Promise<void> => {
+    const head = pending.shift()!;
+    hash.update(typeof head === "string" ? head : await head);
+  };
+  const emit = async (record: string | Promise<string>): Promise<void> => {
+    if (typeof record === "string" && pending.length === 0) {
+      hash.update(record);
+      return;
+    }
+    // Rejections surface when drained in order; until then they must not count as unhandled.
+    if (typeof record !== "string") record.catch(() => undefined);
+    pending.push(record);
+    while (pending.length >= TREE_DIGEST_CONCURRENCY) await drainOldest();
+  };
   const walk = async (dir: string, rel: string): Promise<void> => {
     const entries = (await readdir(dir, { withFileTypes: true })).sort((a, b) =>
       a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
@@ -270,14 +292,16 @@ export async function workspaceTreeDigest(workspace: string): Promise<string> {
       if (DIGEST_EXCLUDES.has(childRel)) continue;
       const abs = join(dir, entry.name);
       const st = await lstat(abs);
-      if (st.isSymbolicLink()) hash.update(`L\0${childRel}\0${await readlink(abs)}\n`);
+      if (st.isSymbolicLink()) await emit(`L\0${childRel}\0${await readlink(abs)}\n`);
       else if (st.isDirectory()) await walk(abs, childRel);
       else if (st.isFile()) {
-        hash.update(`F\0${childRel}\0${st.mode & 0o111 ? "x" : "-"}\0${await fileDigest(abs)}\n`);
-      } else hash.update(`O\0${childRel}\n`);
+        const prefix = `F\0${childRel}\0${st.mode & 0o111 ? "x" : "-"}\0`;
+        await emit(fileDigest(abs).then((digest) => `${prefix}${digest}\n`));
+      } else await emit(`O\0${childRel}\n`);
     }
   };
   await walk(root, "");
+  while (pending.length > 0) await drainOldest();
   return `sha256:${hash.digest("hex")}`;
 }
 
@@ -460,6 +484,12 @@ export async function readReport(
       problems.push(`${EVIDENCE_MANIFEST} is not valid JSON`);
     }
   }
+  // The manifest is untrusted until its signature verifies: any other JSON value
+  // (null, false, 0, "", an array) must fail integrity, never skip the checks.
+  if (manifest !== undefined && (typeof manifest !== "object" || manifest === null)) {
+    problems.push(`${EVIDENCE_MANIFEST} is not a JSON object`);
+    manifest = undefined;
+  }
   if (manifest && !Array.isArray(manifest.artifacts)) {
     problems.push(`${EVIDENCE_MANIFEST} has no artifact list`);
     manifest = undefined;
@@ -469,7 +499,7 @@ export async function readReport(
     else {
       const key = options.key ?? (await signingKey(options.home));
       const expected = manifestSignature(key, manifest);
-      const a = Buffer.from(manifest.signature);
+      const a = Buffer.from(typeof manifest.signature === "string" ? manifest.signature : "");
       const b = Buffer.from(expected);
       if (a.length !== b.length || !timingSafeEqual(a, b))
         problems.push(
@@ -489,14 +519,23 @@ export async function readReport(
       if (options.workspace && manifest.workspaceKey !== workspaceKey(options.workspace))
         problems.push("run belongs to another workspace");
     }
-    const listed = new Map(manifest.artifacts.map((a) => [a.path, a]));
+    const artifacts = manifest.artifacts.filter(
+      (a): a is ManifestArtifact =>
+        typeof a === "object" &&
+        a !== null &&
+        typeof a.path === "string" &&
+        typeof a.sha256 === "string",
+    );
+    if (artifacts.length !== manifest.artifacts.length)
+      problems.push(`${EVIDENCE_MANIFEST} has a malformed artifact entry`);
+    const listed = new Map(artifacts.map((a) => [a.path, a]));
     if (!listed.has(REPORT_JSON)) problems.push(`${REPORT_JSON} is not listed in the manifest`);
     for (const e of report.evidence) {
       const m = listed.get(e.path);
       if (!m || m.sha256 !== e.sha256)
         problems.push(`${e.path}: report evidence does not match the manifest`);
     }
-    for (const artifact of manifest.artifacts) {
+    for (const artifact of artifacts) {
       const abs = join(runDir, artifact.path);
       if (relative(runDir, abs).startsWith("..")) {
         problems.push(`${artifact.path}: path escapes the run directory`);

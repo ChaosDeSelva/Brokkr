@@ -9,6 +9,7 @@ import {
   computeVerdict,
   exitCodeForVerdict,
   summarizeChecks,
+  treeManifest,
   type AppliedException,
   type ApprovedException,
   type CheckResult,
@@ -49,6 +50,7 @@ import { renderMarkdown } from "@brokkr/reporters";
 import { buildCheckEnv, secretEnvValues } from "./env.js";
 import { LocalProcessExecutor, type CheckExecutionResult, type CheckExecutor } from "./executor.js";
 import type { TrustMode } from "./contract.js";
+import { BASE_COMMIT, whenHeldAtBase } from "./guard-baseline.js";
 import { dependencyInstallNeeded, preflightCheck } from "./preflight.js";
 
 export type VerifyEvent =
@@ -112,6 +114,15 @@ export interface VerifyOptions {
   trustMode?: TrustMode;
   /** Approver identities the caller trusts (workspace-untrusted mode). */
   approvers?: string[];
+  /**
+   * Full commit id of the state before the work under test (for example the
+   * task's base commit), as known to the caller. In workspace-untrusted mode a
+   * harness-required check whose `when` guard is not met is excluded from the
+   * required gates only when the guard was not met at this commit either;
+   * without it, or when the check did apply at the base, the verdict is
+   * `incomplete` (the work under test controls the files the guard reads).
+   */
+  baseCommit?: string;
 }
 
 export interface VerifyOutcome {
@@ -176,6 +187,51 @@ async function scrubArtifacts(dir: string): Promise<Array<{ file: string; findin
   return found;
 }
 
+/** Tree digest of a harness (the lock's definition) plus each file's hash, or why it cannot be read. */
+interface HarnessSnapshot {
+  digest: string;
+  files: Map<string, string>;
+}
+
+/**
+ * Snapshot of every harness directory in the set, keyed by `name@version`.
+ * Checks run as the same user as Brokkr, so one check can rewrite a script a
+ * later check executes; comparing this before and after the checks detects it.
+ */
+async function harnessSnapshots(set: ResolvedHarnessSet): Promise<Map<string, HarnessSnapshot>> {
+  const out = new Map<string, HarnessSnapshot>();
+  for (const h of set.harnesses) {
+    const ref = `${h.manifest.metadata.name}@${h.manifest.metadata.version}`;
+    try {
+      const m = await treeManifest(h.dir);
+      out.set(ref, {
+        digest: m.digest,
+        files: new Map(m.files.map((f, i) => [f, m.fileDigests[i]!])),
+      });
+    } catch (error) {
+      out.set(ref, { digest: `unreadable: ${(error as Error).message}`, files: new Map() });
+    }
+  }
+  return out;
+}
+
+const MAX_NAMED_CHANGES = 10;
+
+/** Which files differ between two snapshots, sorted by path, e.g. "added a; modified b". */
+function describeHarnessChanges(before: HarnessSnapshot, after: HarnessSnapshot): string {
+  const paths = [...new Set([...before.files.keys(), ...after.files.keys()])].sort();
+  const changes: string[] = [];
+  for (const path of paths) {
+    const a = before.files.get(path);
+    const b = after.files.get(path);
+    if (a === b) continue;
+    changes.push(`${a === undefined ? "added" : b === undefined ? "removed" : "modified"} ${path}`);
+  }
+  const shown = changes.slice(0, MAX_NAMED_CHANGES).join("; ");
+  const more = changes.length - MAX_NAMED_CHANGES;
+  return more > 0 ? `${shown}; and ${more} more` : shown;
+}
+
 function toResult(
   check: PlannedCheck,
   extra: Partial<CheckResult> & Pick<CheckResult, "state">,
@@ -200,6 +256,11 @@ export async function runVerification(options: VerifyOptions): Promise<VerifyOut
   const now = options.now ?? (() => new Date());
   if (!existsSync(options.workspace))
     throw new BrokkrError("invalid-config", `workspace ${options.workspace} does not exist`);
+  if (options.baseCommit !== undefined && !BASE_COMMIT.test(options.baseCommit))
+    throw new BrokkrError(
+      "invalid-config",
+      `baseCommit '${options.baseCommit}' must be a full commit id (a branch or tag can be moved by the work under test)`,
+    );
   const executor = options.executor ?? new LocalProcessExecutor();
   const callerEnv = options.env ?? process.env;
   const startedAt = now();
@@ -321,9 +382,38 @@ export async function runVerification(options: VerifyOptions): Promise<VerifyOut
     });
   }
 
+  const harnessesBefore = await harnessSnapshots(options.set);
   options.onEvent?.({ type: "run-start", runId: run.id, runDir: run.dir, checks: planned.length });
   const results = new Map<string, CheckResult>();
+  /** Check id → why its not-applicable skip is not trusted (workspace-untrusted mode). */
+  const guardUnverified = new Map<string, string>();
   const knownSecrets = secretEnvValues(callerEnv);
+
+  // The `when` guard reads the workspace, which in workspace-untrusted mode is written by
+  // the work under test: deleting a guard file or script must not drop a required check.
+  const guardNote = async (check: (typeof planned)[number]): Promise<string> => {
+    if (!untrustedMode || !check.required || check.requiredBy === "policy") return "";
+    if (options.baseCommit === undefined) {
+      guardUnverified.set(
+        check.id,
+        "the guard was evaluated only against the workspace under test and no base commit was supplied to compare it with",
+      );
+      return "; not verified against a base commit (workspace-untrusted mode)";
+    }
+    // not_applicable comes only from an unmet `when` guard, so the check has one.
+    const base = await whenHeldAtBase(check.def.when!, {
+      workspace: options.workspace,
+      cwd: check.cwd,
+      baseCommit: options.baseCommit,
+    });
+    if (base.status === "not_held") return `; ${base.detail}`;
+    const why =
+      base.status === "held"
+        ? `the check applied at base commit ${options.baseCommit.slice(0, 12)}, so the work under test changed what its guard reads`
+        : `the guard could not be compared with the base commit: ${base.detail}`;
+    guardUnverified.set(check.id, why);
+    return `; ${why}`;
+  };
 
   const runOne = async (check: (typeof planned)[number]): Promise<CheckResult> => {
     if (blocked.length > 0) {
@@ -397,7 +487,8 @@ export async function runVerification(options: VerifyOptions): Promise<VerifyOut
         command: pre.command,
         state: SKIP_REASONS.has(pre.reason) ? "skipped" : "errored",
         reason: pre.reason,
-        message: pre.message,
+        message:
+          pre.reason === "not_applicable" ? pre.message + (await guardNote(check)) : pre.message,
       });
     }
     const install = await dependencyInstallNeeded(pre.command, pre.cwdDir, options.workspace);
@@ -505,6 +596,26 @@ export async function runVerification(options: VerifyOptions): Promise<VerifyOut
     }
   }
 
+  // The lock pins every file in the harness directory (no ignore list), so any write there,
+  // a new cache file included, is a change: new files can alter what locked scripts load.
+  for (const [ref, after] of await harnessSnapshots(options.set)) {
+    const before = harnessesBefore.get(ref)!;
+    if (after.digest === before.digest) continue;
+    const changes =
+      before.digest.startsWith("unreadable:") || after.digest.startsWith("unreadable:")
+        ? ""
+        : describeHarnessChanges(before, after);
+    const message = `harness ${ref} changed during the run (${before.digest} before the checks, ${after.digest} after${changes ? `; ${changes}` : ""}): later checks may not have run what the lock pins, and the lock covers every file in the harness directory, so checks must not write there`;
+    blocked.push(`harness_tampered: ${message}`);
+    decisions.push({
+      policy: "lock-integrity",
+      stage: "after",
+      outcome: "deny",
+      layer: "system",
+      message,
+    });
+  }
+
   // Refuse swapped paths before artifact scanning can read or redact outside files.
   await run.assertIntact();
   const artifactFindings = [
@@ -541,6 +652,7 @@ export async function runVerification(options: VerifyOptions): Promise<VerifyOut
       ...(c.exceptionId ? { exceptionId: c.exceptionId } : {}),
       ...(c.reason ? { reason: c.reason } : {}),
       ...(c.requiredBy ? { requiredBy: c.requiredBy } : {}),
+      ...(guardUnverified.has(c.id) ? { guardUnverified: guardUnverified.get(c.id)! } : {}),
     })),
     blocked,
     unmet: after.unmet,

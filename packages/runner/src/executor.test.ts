@@ -5,6 +5,7 @@ import {
   CANCEL_GRACE_MS,
   CLEANUP_STEP_MS,
   LocalProcessExecutor,
+  resolveWorkingDirectory,
   type CheckExecutionRequest,
 } from "./index.js";
 import {
@@ -155,6 +156,19 @@ describe("LocalProcessExecutor", () => {
     const controller = new AbortController();
     controller.abort();
     const result = await executor.execute(request(tmp(), [NODE, "-e", "0"]), controller.signal);
+    expect(result.state).toBe("cancelled");
+    expect(result.pid).toBeUndefined();
+  });
+
+  it("is cancelled when the signal aborts while the working directory is resolved", async () => {
+    const controller = new AbortController();
+    // The abort lands before the child is spawned and its abort listener is attached.
+    const pending = executor.execute(
+      request(tmp(), [NODE, "-e", "setTimeout(() => {}, 15000)"]),
+      controller.signal,
+    );
+    controller.abort();
+    const result = await pending;
     expect(result.state).toBe("cancelled");
     expect(result.pid).toBeUndefined();
   });
@@ -451,4 +465,74 @@ describe("pipe fd access used for lsof attribution (fix round 2, minor 8)", () =
       expect(fd).toBeGreaterThanOrEqual(0);
     },
   );
+});
+
+describe("LocalProcessExecutor: requests that cannot start", () => {
+  it("a workspace that does not exist is cwd_rejected", async () => {
+    const result = await executor.execute(request(join(tmp(), "gone"), [NODE, "-v"]));
+    expect(result).toMatchObject({ state: "errored", reason: "cwd_rejected" });
+    expect(result.error).toMatch(/does not exist/);
+  });
+
+  it("a cwd that does not exist is cwd_rejected", async () => {
+    const result = await executor.execute(request(tmp(), [NODE, "-v"], { cwd: "missing" }));
+    expect(result).toMatchObject({
+      state: "errored",
+      reason: "cwd_rejected",
+      error: "cwd 'missing' does not exist",
+    });
+  });
+
+  it("an empty command is invalid_command", async () => {
+    const result = await executor.execute(request(tmp(), []));
+    expect(result).toMatchObject({
+      state: "errored",
+      reason: "invalid_command",
+      error: "empty command",
+    });
+  });
+
+  it("an argument spawn refuses synchronously is a spawn_error, and the log is closed", async () => {
+    const ws = tmp();
+    const result = await executor.execute(request(ws, [NODE, "-e", "0", "a\0b"]));
+    expect(result).toMatchObject({ state: "errored", reason: "spawn_error" });
+    expect(result.error).toMatch(/null bytes/);
+  });
+
+  it("a check killed by a signal is errored with the signal named", async () => {
+    const result = await executor.execute(
+      request(tmp(), [NODE, "-e", "process.kill(process.pid, 'SIGKILL')"]),
+    );
+    expect(result).toMatchObject({ state: "errored", exitCode: null, signal: "SIGKILL" });
+    expect(result.error).toBe("terminated by signal SIGKILL");
+  });
+});
+
+describe("resolveWorkingDirectory", () => {
+  it("accepts a child directory whose name starts with '..' and rejects real escapes", async () => {
+    const ws = tmp();
+    mkdirSync(join(ws, "..generated", "app"), { recursive: true });
+    expect(await resolveWorkingDirectory(ws, "..generated/app")).toEqual({
+      ok: true,
+      dir: join(ws, "..generated", "app"),
+    });
+    expect(await resolveWorkingDirectory(ws, "../x")).toEqual({
+      ok: false,
+      error: "cwd '../x' is outside the workspace",
+    });
+    expect(await resolveWorkingDirectory(ws, "..")).toMatchObject({ ok: false });
+    expect(await resolveWorkingDirectory(ws, tmp())).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/must be relative/),
+    });
+  });
+
+  it("rejects a cwd whose realpath leaves the workspace", async () => {
+    const ws = tmp();
+    symlinkSync(tmp(), join(ws, "..link"));
+    expect(await resolveWorkingDirectory(ws, "..link")).toMatchObject({
+      ok: false,
+      error: expect.stringMatching(/^cwd '\.\.link' resolves to .*, outside the workspace$/),
+    });
+  });
 });

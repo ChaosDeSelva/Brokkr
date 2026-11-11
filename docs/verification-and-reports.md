@@ -10,7 +10,7 @@
 4. **Per check:** waiver, network policy, then preflight: `{{harnessDir}}` expansion, working directory, `when` conditions, executable on `PATH`, package script present, `pnpm exec` binary installed. A failed preflight skips the check with a reason and a diagnostic.
 5. **Execute** through the `CheckExecutor`: argv only, filtered environment, own process group, timeout (SIGTERM, then SIGKILL), bounded logs, streaming secret redaction. Consecutive `parallel: true` checks run concurrently; the rest run in order.
 6. **Evaluate after execution.** Secrets in output, artifacts or generated bundles block the run; `requiredCheckIds` and review requirements are checked.
-7. **Verdict and evidence.** The report and an evidence manifest are written to `.brokkr/runs/run_<ulid>/`.
+7. **Verdict and evidence.** The report and a signed evidence manifest are written to `<home>/.brokkr/runs/<sha256(workspace realpath)>/run_<ulid>/`, outside the verified workspace (`<home>` is `$BROKKR_HOME` or the user's home directory).
 
 ## Check states (spec §8.2)
 
@@ -30,6 +30,7 @@ Skip and error reasons include `missing_tool`, `missing_script`, `not_applicable
 Precedence: `blocked` > `failed` > `incomplete` > `passed` (ADR-005).
 
 * `passed` only when every applicable required check ran and passed.
+* A required check that is skipped as not applicable is excluded from the required set, except in `workspace-untrusted` mode when its guard is not confirmed against a base commit (`--base-commit`): then it keeps the run `incomplete` (ADR-005).
 * A required check that is skipped (other than not applicable, see above), errored, timed out or cancelled makes the run `incomplete` unless an approved exception waived it. Waived checks are shown as `skipped (exception <id>)`, never as passed.
 * A run with nothing required that actually ran is `incomplete`.
 * Optional checks are reported but never change the verdict.
@@ -45,7 +46,7 @@ The canonical report follows spec §10.2 with additions. JSON Schema: `packages/
 |---|---|
 | `id`, `executionId?`, `projectId?`, `taskId?` | run id (`run_<ulid>`), caller correlation id, project, task |
 | `harness`, `harnesses[]` | composed `name`/`version` summary plus `lockDigest`; every harness with its digest |
-| `repository` | `commitSha`, `workspaceId?`, `dirtyTreeDigest` (status, diff against HEAD and untracked file contents), so uncommitted work is identified exactly |
+| `repository` | `commitSha`, `workspaceId?`, `dirtyTreeDigest`: sha256 over every file under the workspace (tracked, untracked and ignored, including `node_modules`; path, executable bit and content; symlink targets; `.git` excluded), taken before the checks run, so the exact on disk state the checks started from is identified, including installed dependencies that decide what the checks execute |
 | `startedAt`, `completedAt` | ISO timestamps |
 | `verdict`, `reasons[]`, `interrupted?` | the verdict and why |
 | `checks[]` | id, required, state, command, cwd, declaring harnesses, exit code, signal, timing, reason, message, exception id, log path, output bytes, truncation, max RSS, secret findings |
@@ -58,13 +59,13 @@ The canonical report follows spec §10.2 with additions. JSON Schema: `packages/
 ## Evidence
 
 ```
-.brokkr/runs/run_<ulid>/
+<home>/.brokkr/runs/<sha256(workspace realpath)>/run_<ulid>/
   report.json  report.md  evidence-manifest.json
   logs/<checkId>.log
   test-results/<checkId>/   screenshots/<checkId>/
 ```
 
-Checks receive `BROKKR_TEST_RESULTS_DIR` and `BROKKR_SCREENSHOTS_DIR` to write artifacts. Every artifact is listed with its SHA-256 in `evidence-manifest.json`. `brokkr report` and `Brokkr.readReport` re hash everything and flag `integrity_failed` on any change; checksums prove evidence has not changed since it was recorded, not who produced it.
+Checks receive `BROKKR_TEST_RESULTS_DIR` and `BROKKR_SCREENSHOTS_DIR` to write artifacts. Text artifacts are secret-scanned and redacted at rest after the checks; files containing a NUL byte (treated as binary) and files over 32 MiB are not scanned. Every artifact is listed with its SHA-256 in `evidence-manifest.json`, which is HMAC-signed with the installation key (`<home>/.brokkr/key`) and bound to the workspace and runs root. `brokkr report` and `Brokkr.readReport` check the signature, re hash everything and flag `integrity_failed` on any change or on a missing, unsigned or malformed manifest; the signature proves the run was written by this installation, not that a check's output is honest.
 
 ## Formats
 

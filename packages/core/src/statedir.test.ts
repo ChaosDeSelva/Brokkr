@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -43,6 +44,13 @@ describe("ensureSafeDir (audit I6)", () => {
     });
     await expect(ensureSafeDir(tmp(), "../x")).rejects.toMatchObject({ code: "policy-denied" });
   });
+
+  it("accepts a directory whose name merely starts with '..'", async () => {
+    const base = tmp();
+    const dir = await ensureSafeDir(base, "..cache/runs");
+    expect(dir).toBe(join(base, "..cache", "runs"));
+    expect(existsSync(dir)).toBe(true);
+  });
 });
 
 describe("ensureSafeDir with a base that does not exist yet", () => {
@@ -50,5 +58,26 @@ describe("ensureSafeDir with a base that does not exist yet", () => {
     const base = join(tmp(), "fresh-home");
     const dir = await ensureSafeDir(base, ".brokkr/runs");
     expect(existsSync(dir)).toBe(true);
+  });
+});
+
+describe("ensureSafeDir called concurrently", () => {
+  it("every caller succeeds when they create the same directories at once", async () => {
+    const base = tmp();
+    const dirs = await Promise.all(
+      Array.from({ length: 4 }, () => ensureSafeDir(base, ".brokkr/runs/abc")),
+    );
+    expect(new Set(dirs)).toEqual(new Set([join(base, ".brokkr", "runs", "abc")]));
+    expect(existsSync(dirs[0]!)).toBe(true);
+  });
+
+  it("a mkdir failure other than EEXIST is not swallowed", async () => {
+    const base = tmp();
+    chmodSync(base, 0o500);
+    try {
+      await expect(ensureSafeDir(base, "state")).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      chmodSync(base, 0o700);
+    }
   });
 });
